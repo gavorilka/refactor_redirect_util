@@ -31,6 +31,13 @@ async function runSafeMigration() {
     const domainStr = escapeRegExp(config.domain);
     const globalDomainStr = escapeRegExp(config.globalDomain || 'com');
     const allowedHttpCodes = JSON.parse(config.targetHttpCodes).map(Number);
+    const startFromRow = (() => {
+        try {
+            return Number(config.startFromRow) || 2;
+        } catch (e) {
+            return 2;
+        }
+    })();
 
     // --- НАСТРОЙКИ ПОДКЛЮЧЕНИЯ ---
     const dbConfig = {
@@ -49,9 +56,16 @@ async function runSafeMigration() {
         console.log('Соединение с БД успешно установлено.');
 
         // Создаем CSV файл и записываем заголовки колонок
+        // ЧЕНДЖ: Переписана инициализация логов. Если мы начинаем НЕ сначала (startFromRow > 2)
+        // и файл уже существует, то МЫ НЕ ЗАТИРАЕМ его, а просто продолжаем писать в конец.
         if (config.logFilePath) {
-            fs.writeFileSync(config.logFilePath, 'product_id,language_id,old_url,new_url\n', 'utf8');
-            console.log(`Файл логов инициализирован: ${config.logFilePath}`);
+            const fileExists = fs.existsSync(config.logFilePath);
+            if (startFromRow <= 2 || !fileExists) {
+                fs.writeFileSync(config.logFilePath, 'product_id,language_id,old_url,new_url\n', 'utf8');
+                console.log(`Файл логов инициализирован с нуля: ${config.logFilePath}`);
+            } else {
+                console.log(`Файл логов уже существует. Продолжаем запись в: ${config.logFilePath}`);
+            }
         }
 
         const workbook = new ExcelJS.stream.xlsx.WorkbookReader(config.get("EXCEL_FILE_PATH"), {});
@@ -65,11 +79,18 @@ async function runSafeMigration() {
             let headers = [];
 
             for await (const row of worksheet) {
-                console.log(`Строка: ${row.number}`)
+                // Строку №1 (шапку) обрабатываем ВСЕГДА, чтобы прочитать названия колонок
                 if (row.number === 1) {
                     headers = row.values.map(v => typeof v === 'string' ? v.trim() : v);
                     continue;
                 }
+
+                // ЧЕНДЖ: Пропускаем строки, если текущий номер меньше заданного начального
+                if (row.number < startFromRow) {
+                    continue;
+                }
+
+                console.log(`Строка: ${row.number}`)
 
                 checkedRows++;
 
