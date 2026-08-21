@@ -162,7 +162,7 @@ async function runSafeMigration() {
     } catch (error) {
         console.error('Критический сбой скрипта:', error);
     } finally {
-        if (pool) await pool.end();
+        if (pool) pool.end();
     }
 }
 
