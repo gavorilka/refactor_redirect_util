@@ -15,6 +15,33 @@ const dbConfig = {
     queueLimit: 0
 }
 
+const designImg = [
+    {
+        src: `/image/catalog/Dizain/cveta_fasadov.jpg`,
+        title: `Цвета фасадов`,
+    },
+    {
+        src: `/image/catalog/Dizain/Cveta_stoleshnic.jpg`,
+        title: `Цвета столешниц`
+    },
+    {
+        src: `/image/catalog/Dizain/Dekori_stoleshnic.jpg`,
+        title: `Декоры столешниц`
+    },
+    {
+        src: `/image/catalog/Dizain/Ruchki_v_complekte.jpg`,
+        title: `Ручки в комплекте`
+    },
+    {
+        src: `/image/catalog/Dizain/Steklo_v_komplekte.jpg`,
+        title: `Стекло в комплекте`
+    },
+    {
+        src: `/image/catalog/Dizain/v_komplekt_vhodit.jpg`,
+        title: `В комплект входит`
+    }
+]
+
 // Создаем пул соединений
 const pool = mysql.createPool(dbConfig);
 console.log('Пул подключений к MySQL успешно инициализирован.');
@@ -59,13 +86,21 @@ async function main() {
                 if (images.length === 0) {
                     continue;
                 }
-
                 images.forEach((img, index) => {
-                    const photoNumber = index + 1;
-                    const newValue = `${name} ${photoNumber} фото`;
+                    // Ищем совпадение по src
+                    const matchedDesign = designImg.find(design => img.src.includes(design.src));
 
-                    img.setAttribute('alt', newValue);
-                    img.setAttribute('title', newValue);
+                    if (matchedDesign) {
+                        // Если найдено совпадение, используем title из массива
+                        img.setAttribute('alt', matchedDesign.title);
+                        img.setAttribute('title', matchedDesign.title);
+                    } else {
+                        // Если совпадений нет, используем стандартный формат
+                        const photoNumber = index + 1;
+                        const newValue = `${name} ${photoNumber} фото`;
+                        img.setAttribute('alt', newValue);
+                        img.setAttribute('title', newValue);
+                    }
                 });
 
                 const modifiedHtml = document.body.innerHTML;
