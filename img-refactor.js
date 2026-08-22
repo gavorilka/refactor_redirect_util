@@ -86,6 +86,8 @@ async function main() {
                 if (images.length === 0) {
                     continue;
                 }
+
+                let countDesignImg = 0
                 images.forEach((img, index) => {
                     // Ищем совпадение по src
                     const matchedDesign = designImg.find(design => img.src.includes(design.src));
@@ -94,9 +96,10 @@ async function main() {
                         // Если найдено совпадение, используем title из массива
                         img.setAttribute('alt', matchedDesign.title);
                         img.setAttribute('title', matchedDesign.title);
+                        countDesignImg++;
                     } else {
                         // Если совпадений нет, используем стандартный формат
-                        const photoNumber = index + 1;
+                        const photoNumber = index - countDesignImg + 1;
                         const newValue = `${name} ${photoNumber} фото`;
                         img.setAttribute('alt', newValue);
                         img.setAttribute('title', newValue);
