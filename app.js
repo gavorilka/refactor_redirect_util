@@ -11,6 +11,14 @@ function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+
+function escapeLike(value) {
+    return String(value)
+        .replace(/\\/g, '\\\\')
+        .replace(/%/g, '\\%')
+        .replace(/_/g, '\\_');
+}
+
 function getCleanValue(row, headers, columnName) {
     const colIndex = headers.indexOf(columnName);
     if (colIndex === -1) return null;
@@ -21,11 +29,62 @@ function getCleanValue(row, headers, columnName) {
 }
 
 // Функция для записи строки в CSV (автоматически экранирует кавычки и запятые)
-function appendToCsv(productId, languageId, oldUrl, newUrl) {
+function appendToCsv(productId, languageId, oldUrl, newUrl, positionInExcel) {
     const escapeCsv = (text) => `"${String(text).replace(/"/g, '""')}"`;
-    const row = `${escapeCsv(productId)},${escapeCsv(languageId)},${escapeCsv(oldUrl)},${escapeCsv(newUrl)}\n`;
+    const row = `${escapeCsv(productId)},${escapeCsv(languageId)},${escapeCsv(oldUrl)},${escapeCsv(newUrl)},${escapeCsv(positionInExcel)}\n`;
     fs.appendFileSync(config.logFilePath, row, 'utf8');
 }
+
+
+const SQL_BATCH_SIZE = 200;
+
+// Читаем результаты порциями, не загружая всю выборку в память.
+async function* findDescriptionsByUrl(pool, searchPattern) {
+    let lastProductId = 0;
+    let lastLanguageId = 0;
+
+    while (true) {
+        const [rows] = await pool.execute(
+            `
+            SELECT product_id, language_id, description
+            FROM oc_product_description
+            WHERE description LIKE ?
+              AND (
+                  product_id > ?
+                  OR (
+                      product_id = ?
+                      AND language_id > ?
+                  )
+              )
+            ORDER BY product_id, language_id
+            LIMIT ?
+            `,
+            [
+                searchPattern,
+                lastProductId,
+                lastProductId,
+                lastLanguageId,
+                SQL_BATCH_SIZE,
+            ],
+        );
+
+        if (rows.length === 0) {
+            break;
+        }
+
+        for (const item of rows) {
+            lastProductId = Number(item.product_id);
+            lastLanguageId = Number(item.language_id);
+
+            yield item;
+        }
+
+        if (rows.length < SQL_BATCH_SIZE) {
+            break;
+        }
+    }
+}
+
 
 async function runSafeMigration() {
     const domainStr = escapeRegExp(config.domain);
@@ -61,7 +120,7 @@ async function runSafeMigration() {
         if (config.logFilePath) {
             const fileExists = fs.existsSync(config.logFilePath);
             if (startFromRow <= 2 || !fileExists) {
-                fs.writeFileSync(config.logFilePath, 'product_id,language_id,old_url,new_url\n', 'utf8');
+                fs.writeFileSync(config.logFilePath, 'product_id,language_id,old_url,new_url,position_in_excel\n', 'utf8');
                 console.log(`Файл логов инициализирован с нуля: ${config.logFilePath}`);
             } else {
                 console.log(`Файл логов уже существует. Продолжаем запись в: ${config.logFilePath}`);
@@ -109,42 +168,55 @@ async function runSafeMigration() {
                         if (!cleanUrl || cleanUrl === '/') continue;
 
                         // Чтобы найти все записи, используем базовый поиск по подстроке
-                        const searchPattern = `%${cleanUrl}%`;
+                        const searchPattern = `%${escapeLike(cleanUrl)}%`;
 
-                        const [rowsToUpdate] = await pool.query(
-                            'SELECT product_id, language_id, description FROM oc_product_description WHERE description LIKE ?',
-                            [searchPattern]
-                        );
 
-                        for (const item of rowsToUpdate) {
+                        for await (const item of findDescriptionsByUrl(pool, searchPattern)) {
                             const oldDescription = item.description;
 
                             // Создаем регулярное выражение для поиска конкретного URL внутри href="..." или href=&quot;...&quot;
-                            const escapedUrl = escapeRegExp(cleanUrl).replace(/\\\/$/, ''); // убираем слэш с конца для универсальности regex
+                            const escapedUrl = escapeRegExp(cleanUrl)
+                                .replace(/\\\/$/, '');
 
                             // Шаблон ищет совпадение ссылки целиком, предотвращая частичную склейку подкатегорий
                             const hrefRegex = new RegExp(
-                                `(href\\s*=\\s*(?:"|'|&quot;|\\\\"))(https?:\\/\\/(?:www\\.)?${domainStr}\\.${globalDomainStr})?(${escapedUrl}\\/?)(?=\\s*["'&]|&quot;|\\\\")`,
-                                'g'
+                                `(href\\s*=\\s*(?:"|'|&quot;|\\\\\\"))` +
+                                `(https?:\\/\\/(?:www\\.)?${domainStr}\\.${globalDomainStr})?` +
+                                `(${escapedUrl}\\/?)(?=\\s*["'&]|&quot;|\\\\")`,
+                                'gi',
                             );
 
-                            // Выполняем замену
-                            const newDescription = oldDescription.replace(hrefRegex, (match, p1, p2) => {
-                                // p1 — это 'href="', p2 — это домен (если был абсолютным)
-                                const currentDomain = p2 || '';
-                                return `${p1}${currentDomain}${cleanTarget}`;
-                            });
+                            const newDescription = oldDescription.replace(
+                                hrefRegex,
+                                (match, prefix, currentDomain = '') =>
+                                    `${prefix}${currentDomain}${cleanTarget}`,
+                            );
 
-                            // Если замена действительно произошла и строка изменилась
                             if (oldDescription !== newDescription) {
-                                await pool.query(
-                                    'UPDATE oc_product_description SET description = ? WHERE product_id = ? AND language_id = ?',
-                                    [newDescription, item.product_id, item.language_id]
-                                );
-                                console.log(`Обновление ссылки: ${url}\n На: ${target}`)
-                                if (config.logFilePath) {
-                                    appendToCsv(item.product_id, item.language_id, url, target);
+                                if (config.dryRun != 'true') {
+                                    await pool.query(
+                                        'UPDATE oc_product_description SET description = ? WHERE product_id = ? AND language_id = ?',
+                                        [newDescription, item.product_id, item.language_id]
+                                    );
+                                } else {
+                                    // Пока только режим проверки: БД не изменяем.
+                                    console.log(
+                                        `Найдена замена: product_id=${item.product_id}, ` +
+                                        `language_id=${item.language_id}: ${url} -> ${target}`,
+                                    );
                                 }
+
+
+                                if (config.logFilePath) {
+                                    appendToCsv(
+                                        item.product_id,
+                                        item.language_id,
+                                        url,
+                                        target,
+                                        row.number
+                                    );
+                                }
+
                                 dbUpdatesCount++;
                             }
                         }

@@ -1,5 +1,6 @@
-migration_log*.csv
-data.xlsx
+migration_log*.
+*.xlsx
+*.csv
 
 node_modules
 .DS_Store
