@@ -6,6 +6,9 @@ import {ConfigService} from "./config.service.js";
 
 const config = ConfigService.getInstance()
 
+const checkEmptyTarget = config.checkEmptyTarget === 'true';
+const noDryRun = config.dryRun !== 'true';
+
 // Сначала объявляем функцию экранирования, чтобы её можно было безопасно вызвать выше
 function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -23,8 +26,14 @@ function getCleanValue(row, headers, columnName) {
     const colIndex = headers.indexOf(columnName);
     if (colIndex === -1) return null;
     const cell = row.getCell(colIndex);
-    if (!cell || cell.value === undefined || cell.value === null) return null;
-    if (typeof cell.value === 'object') return cell.value.text || cell.value.result || null;
+    if (!cell || cell.value === undefined) return null;
+    if (cell.value && typeof cell.value === 'object' && cell.value.hasOwnProperty('richText')) {
+        return cell.value.richText.map(rt => rt.text).join('').trim();
+    }
+    if (cell.value && typeof cell.value === 'object' && cell.value.hasOwnProperty('text')) {
+        return cell.value.text.trim();
+    }
+    if (cell.value === null) return null;
     return String(cell.value).trim();
 }
 
@@ -85,6 +94,50 @@ async function* findDescriptionsByUrl(pool, searchPattern) {
     }
 }
 
+// Раскрывает цепочку редиректов до финального URL со статусом 2xx.
+async function resolveRedirectChain(startUrl, { maxRedirects = 10, timeoutMs = 15000 } = {}) {
+    let currentUrl = startUrl;
+    const chain = [];
+
+    for (let i = 0; i <= maxRedirects; i++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        let response;
+        try {
+            response = await fetch(currentUrl, {
+                method: 'GET',
+                redirect: 'manual',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; UrlMigrationBot/1.0)',
+                    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                },
+                signal: controller.signal,
+            });
+        } finally {
+            clearTimeout(timer);
+        }
+
+        if (response.status >= 300 && response.status < 400) {
+            const location = response.headers.get('location');
+            if (!location) {
+                throw new Error(`Редирект ${response.status} без Location на ${currentUrl}`);
+            }
+            const nextUrl = new URL(location, currentUrl).toString();
+            chain.push({ from: currentUrl, to: nextUrl, status: response.status });
+            currentUrl = nextUrl;
+            continue;
+        }
+
+        if (response.status >= 200 && response.status < 300) {
+            return { finalUrl: currentUrl, status: response.status, chain };
+        }
+
+        throw new Error(`Финальный статус ${response.status} для ${currentUrl}`);
+    }
+
+    throw new Error(`Превышено число редиректов (${maxRedirects}) для ${startUrl}`);
+}
 
 async function runSafeMigration() {
     const domainStr = escapeRegExp(config.domain);
@@ -134,21 +187,20 @@ async function runSafeMigration() {
 
         const usingRegExp = new RegExp(`https?:\\/\\/(www\\.)?${domainStr}\\.${globalDomainStr}`, 'i');
 
+        const redirectCache = new Map();
+
         for await (const worksheet of workbook) {
             let headers = [];
-
             for await (const row of worksheet) {
                 // Строку №1 (шапку) обрабатываем ВСЕГДА, чтобы прочитать названия колонок
                 if (row.number === 1) {
                     headers = row.values.map(v => typeof v === 'string' ? v.trim() : v);
                     continue;
                 }
-
                 // ЧЕНДЖ: Пропускаем строки, если текущий номер меньше заданного начального
                 if (row.number < startFromRow) {
                     continue;
                 }
-
                 console.log(`Строка: ${row.number}`)
 
                 checkedRows++;
@@ -156,72 +208,107 @@ async function runSafeMigration() {
                 const httpCode = getCleanValue(row, headers, 'httpCode');
                 const url = getCleanValue(row, headers, 'url');
                 const target = getCleanValue(row, headers, 'target');
+               // console.log(`  httpCode: ${httpCode}, url: ${url}, target: ${target}`);
 
-                if (httpCode && allowedHttpCodes.includes(Number(httpCode)) && url && target) {
+                if (httpCode && allowedHttpCodes.includes(Number(httpCode)) && url) {
+                    let effectiveTarget = target;
 
-                    try {
-                        // Очищаем протоколы и домены, чтобы корректно сравнивать и абсолютные, и относительные ссылки
-                        const cleanUrl = url.replace(usingRegExp, '');
-                        const cleanTarget = target.replace(usingRegExp, '');
+                    // target отсутствует — пробуем раскрутить редирект самостоятельно
+                    if (checkEmptyTarget && !effectiveTarget) {
+                        let resolved = redirectCache.get(url);
 
-                        // Если после очистки URL пустой (ссылка на главную), пропускаем во избежание коллизий
-                        if (!cleanUrl || cleanUrl === '/') continue;
-
-                        // Чтобы найти все записи, используем базовый поиск по подстроке
-                        const searchPattern = `%${escapeLike(cleanUrl)}%`;
-
-
-                        for await (const item of findDescriptionsByUrl(pool, searchPattern)) {
-                            const oldDescription = item.description;
-
-                            // Создаем регулярное выражение для поиска конкретного URL внутри href="..." или href=&quot;...&quot;
-                            const escapedUrl = escapeRegExp(cleanUrl)
-                                .replace(/\\\/$/, '');
-
-                            // Шаблон ищет совпадение ссылки целиком, предотвращая частичную склейку подкатегорий
-                            const hrefRegex = new RegExp(
-                                `(href\\s*=\\s*(?:"|'|&quot;|\\\\\\"))` +
-                                `(https?:\\/\\/(?:www\\.)?${domainStr}\\.${globalDomainStr})?` +
-                                `(${escapedUrl}\\/?)(?=\\s*["'&]|&quot;|\\\\")`,
-                                'gi',
-                            );
-
-                            const newDescription = oldDescription.replace(
-                                hrefRegex,
-                                (match, prefix, currentDomain = '') =>
-                                    `${prefix}${currentDomain}${cleanTarget}`,
-                            );
-
-                            if (oldDescription !== newDescription) {
-                                if (config.dryRun != 'true') {
-                                    await pool.query(
-                                        'UPDATE oc_product_description SET description = ? WHERE product_id = ? AND language_id = ?',
-                                        [newDescription, item.product_id, item.language_id]
-                                    );
-                                } else {
-                                    // Пока только режим проверки: БД не изменяем.
-                                    console.log(
-                                        `Найдена замена: product_id=${item.product_id}, ` +
-                                        `language_id=${item.language_id}: ${url} -> ${target}`,
-                                    );
-                                }
-
-
-                                if (config.logFilePath) {
-                                    appendToCsv(
-                                        item.product_id,
-                                        item.language_id,
-                                        url,
-                                        target,
-                                        row.number
-                                    );
-                                }
-
-                                dbUpdatesCount++;
+                        if (!resolved) {
+                            try {
+                                resolved = await resolveRedirectChain(url);
+                            } catch (e) {
+                                console.warn(
+                                    `  [строка XLSX №${row.number}] не удалось разрешить редирект для ${url}: ${e.message}`,
+                                );
+                                resolved = { error: e.message };
                             }
+                            redirectCache.set(url, resolved);
                         }
-                    } catch (dbError) {
-                        console.error(`Ошибка СУБД на строке XLSX №${row.number}:`, dbError.message);
+
+                        if (resolved.error) {
+                            continue; // без target заменять нечего
+                        }
+
+                        if (resolved.finalUrl === url) {
+                            console.log(`  URL ${url} не редиректит — пропуск`);
+                            continue;
+                        }
+
+                        effectiveTarget = resolved.finalUrl;
+                        console.log(
+                            `  Разрешён редирект для XLSX №${row.number}: ${url} -> ${effectiveTarget} (${resolved.status})`,
+                        );
+                    }
+
+                    if(effectiveTarget) {
+                        try {
+                            // Очищаем протоколы и домены, чтобы корректно сравнивать и абсолютные, и относительные ссылки
+                            const cleanUrl = url.replace(usingRegExp, '');
+                            const cleanTarget = effectiveTarget.replace(usingRegExp, '');
+
+                            // Если после очистки URL пустой (ссылка на главную), пропускаем во избежание коллизий
+                            if (!cleanUrl || cleanUrl === '/') continue;
+
+                            // Чтобы найти все записи, используем базовый поиск по подстроке
+                            const searchPattern = `%${escapeLike(cleanUrl)}%`;
+
+
+                            for await (const item of findDescriptionsByUrl(pool, searchPattern)) {
+                                const oldDescription = item.description;
+
+                                // Создаем регулярное выражение для поиска конкретного URL внутри href="..." или href=&quot;...&quot;
+                                const escapedUrl = escapeRegExp(cleanUrl)
+                                    .replace(/\\\/$/, '');
+
+                                // Шаблон ищет совпадение ссылки целиком, предотвращая частичную склейку подкатегорий
+                                const hrefRegex = new RegExp(
+                                    `(href\\s*=\\s*(?:"|'|&quot;|\\\\\\"))` +
+                                    `(https?:\\/\\/(?:www\\.)?${domainStr}\\.${globalDomainStr})?` +
+                                    `(${escapedUrl}\\/?)(?=\\s*["'&]|&quot;|\\\\")`,
+                                    'gi',
+                                );
+
+                                const newDescription = oldDescription.replace(
+                                    hrefRegex,
+                                    (match, prefix, currentDomain = '') =>
+                                        `${prefix}${currentDomain}${cleanTarget}`,
+                                );
+
+                                if (oldDescription !== newDescription) {
+                                    if (noDryRun) {
+                                        await pool.query(
+                                            'UPDATE oc_product_description SET description = ? WHERE product_id = ? AND language_id = ?',
+                                            [newDescription, item.product_id, item.language_id]
+                                        );
+                                    } else {
+                                        // Пока только режим проверки: БД не изменяем.
+                                        console.log(
+                                            `Найдена замена: product_id=${item.product_id}, ` +
+                                            `language_id=${item.language_id}: ${url} -> ${effectiveTarget}`,
+                                        );
+                                    }
+
+
+                                    if (config.logFilePath) {
+                                        appendToCsv(
+                                            item.product_id,
+                                            item.language_id,
+                                            url,
+                                            effectiveTarget,
+                                            row.number
+                                        );
+                                    }
+
+                                    dbUpdatesCount++;
+                                }
+                            }
+                        } catch (dbError) {
+                            console.error(`Ошибка СУБД на строке XLSX №${row.number}:`, dbError.message);
+                        }
                     }
                 }
             }
